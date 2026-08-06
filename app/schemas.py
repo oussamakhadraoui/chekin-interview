@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 from decimal import Decimal
-from typing import Annotated
+from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field, PlainSerializer
 
@@ -24,13 +24,60 @@ PositiveMoney = Annotated[
 ]
 
 
+class ErrorDetail(BaseModel):
+    code: str = Field(
+        description="Stable machine-readable code. Switch on this, not the HTTP status."
+    )
+    message: str = Field(
+        description="Human-readable explanation. May change; do not parse."
+    )
+    details: dict[str, Any] | None = Field(
+        default=None, description="Structured context, e.g. the offending account id."
+    )
+
+
+class ErrorResponse(BaseModel):
+    """The single envelope every failure uses, domain and validation alike."""
+
+    error: ErrorDetail
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "error": {
+                        "code": "INSUFFICIENT_FUNDS",
+                        "message": "Source account has insufficient funds.",
+                        "details": {
+                            "account_id": "3f6c1e4a-...",
+                            "balance": "10.0000",
+                            "requested": "50.0000",
+                        },
+                    }
+                }
+            ]
+        }
+    )
+
+
 class CreateAccountRequest(BaseModel):
     # Opening a non-zero account is money appearing from nowhere. It is allowed here
     # because the exercise needs a way to get money into the system and there is no
     # external funding rail; see README for how this would work in production.
     initial_balance: Annotated[
-        Decimal, Field(ge=0, max_digits=20, decimal_places=4)
+        Decimal,
+        Field(
+            ge=0,
+            max_digits=20,
+            decimal_places=4,
+            description=(
+                "Opening balance. Send as a string to avoid float rounding. "
+                "Recorded immutably so the ledger can be reconciled against it."
+            ),
+        ),
     ] = Decimal("0")
+
+    model_config = ConfigDict(json_schema_extra={"examples": [{"initial_balance": "500.00"}]})
 
 
 class AccountResponse(BaseModel):
@@ -49,9 +96,28 @@ class BalanceResponse(BaseModel):
 
 
 class TransferRequest(BaseModel):
-    from_account_id: uuid.UUID
-    to_account_id: uuid.UUID
-    amount: PositiveMoney
+    from_account_id: uuid.UUID = Field(
+        description="Account to debit. Must differ from the destination."
+    )
+    to_account_id: uuid.UUID = Field(description="Account to credit.")
+    amount: PositiveMoney = Field(
+        description=(
+            "Strictly positive. Send as a string. Equivalent encodings "
+            '("25", "25.00", 25) are treated as the same transfer when retried.'
+        )
+    )
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "from_account_id": "3f6c1e4a-9a1b-4c2d-8e3f-0a1b2c3d4e5f",
+                    "to_account_id": "7b2d8c5e-1f4a-4b6c-9d8e-2f3a4b5c6d7e",
+                    "amount": "125.50",
+                }
+            ]
+        }
+    )
 
 
 class TransferResponse(BaseModel):

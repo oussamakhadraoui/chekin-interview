@@ -10,10 +10,72 @@ from app.routers import accounts, transfers
 
 configure_logging()
 
+API_DESCRIPTION = """
+A money-movement ledger. Accounts hold balances; clients transfer funds between them
+and query balances and history.
+
+The service is designed to run as **several stateless instances behind a load
+balancer**, sharing one PostgreSQL database. Any request can land on any instance, and
+a retry need not reach the same process as the original. Every guarantee below is
+therefore enforced in the database, not in application memory.
+
+### Guarantees
+
+**Exactly-once transfers.** Every `POST /transfers` carries a required
+`Idempotency-Key`. Retrying with the same key returns the original result and moves no
+additional money — whichever instance handles the retry.
+
+**Money is conserved.** Each transfer writes two signed rows to an append-only ledger
+that always nets to zero. Balances can never go negative; a database `CHECK` constraint
+enforces that even if the application is wrong.
+
+**Correct under concurrency.** Both accounts are row-locked in a globally consistent
+order before any balance is read for a decision, so simultaneous transfers can neither
+overdraw an account nor deadlock against each other.
+
+### Handling failures
+
+If a transfer does not return — timeout, reset, `503` — **resend the identical request
+with the same `Idempotency-Key`**. That is the correct and safe recovery path. Do not
+generate a new key for a retry, and do not reuse a key for a different transfer.
+
+Check the `Idempotent-Replay` response header to tell a fresh execution (`false`, `201`)
+from a replay of an earlier one (`true`, `200`).
+
+### Money format
+
+Amounts are `NUMERIC(20,4)` in the database and **strings** on the wire (`"125.50"`).
+JSON numbers are IEEE-754 doubles in most parsers, which silently corrupts money. Send
+strings; you will always receive strings, normalised to four decimal places.
+
+### Errors
+
+Every failure — validation and domain alike — uses one envelope. Switch on `code`; the
+HTTP status is coarse guidance and `message` is for humans.
+
+```json
+{"error": {"code": "INSUFFICIENT_FUNDS", "message": "...", "details": {}}}
+```
+"""
+
+TAGS_METADATA = [
+    {"name": "accounts", "description": "Open accounts, read balances and history."},
+    {
+        "name": "transfers",
+        "description": "Move money. The only endpoint that mutates balances.",
+    },
+    {
+        "name": "ops",
+        "description": "Liveness and readiness probes. Not part of the client contract.",
+    },
+]
+
 app = FastAPI(
     title="Transaction Ledger API",
     version="0.1.0",
-    description="Idempotent money movement that conserves value under concurrency.",
+    summary="Idempotent money movement that conserves value under concurrency.",
+    description=API_DESCRIPTION,
+    openapi_tags=TAGS_METADATA,
 )
 
 app.include_router(accounts.router)
@@ -66,7 +128,7 @@ def _summarise(exc: RequestValidationError) -> list[dict[str, str]]:
     ]
 
 
-@app.get("/health", tags=["ops"])
+@app.get("/health", tags=["ops"], summary="Liveness probe")
 def health():
     """Liveness: is this process running?
 
@@ -77,7 +139,12 @@ def health():
     return {"status": "ok"}
 
 
-@app.get("/ready", tags=["ops"])
+@app.get(
+    "/ready",
+    tags=["ops"],
+    summary="Readiness probe",
+    responses={503: {"description": "Cannot reach the database; pull from rotation."}},
+)
 def ready():
     """Readiness: should the load balancer send this instance traffic?
 
