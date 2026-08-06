@@ -217,7 +217,10 @@ against an ordering that depends on the query planner.
 Supporting details: `populate_existing=True` forces the locked read to refresh the
 object rather than returning a pre-lock value from SQLAlchemy's identity map;
 `lock_timeout` (3s) bounds every lock wait so a hot account cannot drain the connection
-pool and take unrelated transfers down with it; and a `40P01` deadlock is logged at
+pool and take unrelated transfers down with it — verified to cover the idempotency
+key's unique-index wait as well as the row locks, so a retry storm behind one slow
+transfer is bounded too, and surfaces as a retryable 503 rather than a pile-up; and a
+`40P01` deadlock is logged at
 **error** level, because with a global lock order its rate should be exactly zero and a
 nonzero rate means the ordering invariant has been broken somewhere.
 
