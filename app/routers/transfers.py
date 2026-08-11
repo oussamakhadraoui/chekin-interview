@@ -5,8 +5,10 @@ from fastapi import APIRouter, Header, Response, status
 from app.db import DbSession
 from app.errors import (
     AccountNotFound,
+    AmountOutOfRange,
     IdempotencyKeyConflict,
     InsufficientFunds,
+    InvalidIdempotencyKey,
     LockTimeout,
     MissingIdempotencyKey,
     SameAccountTransfer,
@@ -14,6 +16,7 @@ from app.errors import (
     openapi_responses,
 )
 from app.schemas import TransferRequest, TransferResponse
+from app.services.idempotency import require_key
 from app.services.transfers import execute_transfer
 
 router = APIRouter(prefix="/transfers", tags=["transfers"])
@@ -39,10 +42,12 @@ router = APIRouter(prefix="/transfers", tags=["transfers"])
         },
         **openapi_responses(
             MissingIdempotencyKey,
+            InvalidIdempotencyKey,
             SameAccountTransfer,
             AccountNotFound,
             IdempotencyKeyConflict,
             InsufficientFunds,
+            AmountOutOfRange,
             ValidationFailed,
             LockTimeout,
         ),
@@ -77,10 +82,7 @@ def create_transfer(
     correct way to recover, and it is guaranteed not to move money twice even if the
     retry lands on a different instance than the original.
     """
-    if not idempotency_key or not idempotency_key.strip():
-        raise MissingIdempotencyKey("The Idempotency-Key header is required.")
-
-    outcome = execute_transfer(db, idempotency_key.strip(), payload)
+    outcome = execute_transfer(db, require_key(idempotency_key), payload)
 
     response.status_code = outcome.status_code
     # Lets a client (and anyone reading logs) tell "your transfer went through just

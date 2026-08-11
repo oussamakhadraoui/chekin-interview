@@ -65,6 +65,25 @@ def test_retry_after_insufficient_funds_can_succeed(client):
     assert_ledger_invariants(expected_total=Decimal("110"))
 
 
+def test_transferring_the_entire_balance_succeeds(client):
+    """The boundary the funds check sits on.
+
+    `if source.balance < req.amount` means "exactly the balance" must succeed and leave
+    zero. It is covered incidentally by the concurrent-withdrawal test, where the fifth
+    transfer drains the account -- but only as a side effect of an assertion about counts.
+    Stated explicitly, it is what stops a future "fix" from flipping `<` to `<=` and
+    silently making the last penny in every account unspendable.
+    """
+    src = make_account(client, "50")
+    dst = make_account(client, "0")
+
+    assert transfer(client, src, dst, "50").status_code == 201
+
+    assert balance_of(client, src) == Decimal("0")
+    assert balance_of(client, dst) == Decimal("50")
+    assert_ledger_invariants(expected_total=Decimal("50"))
+
+
 def test_self_transfer_is_rejected(client):
     account_id = make_account(client, "100")
     resp = transfer(client, account_id, account_id, "10")
@@ -132,9 +151,7 @@ def test_database_refuses_a_negative_balance(client):
     account_id = make_account(client, "5")
     try:
         with engine.begin() as conn:
-            conn.execute(
-                text("UPDATE accounts SET balance = -1 WHERE id = :i"), {"i": account_id}
-            )
+            conn.execute(text("UPDATE accounts SET balance = -1 WHERE id = :i"), {"i": account_id})
     except sqlalchemy.exc.IntegrityError as exc:
         assert "ck_accounts_balance_non_negative" in str(exc)
     else:

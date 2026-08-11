@@ -18,6 +18,7 @@ os.environ["DATABASE_URL"] = TEST_DATABASE_URL
 
 import threading  # noqa: E402
 import time  # noqa: E402
+import uuid  # noqa: E402
 from decimal import Decimal  # noqa: E402
 
 import httpx  # noqa: E402
@@ -110,10 +111,19 @@ def http(live_server):
 # --- helpers ------------------------------------------------------------------
 
 
-def make_account(client_or_http, balance: str) -> str:
-    resp = client_or_http.post("/accounts", json={"initial_balance": balance})
+def make_account(client_or_http, balance: str, key: str | None = None) -> str:
+    resp = client_or_http.post(
+        "/accounts",
+        json={"initial_balance": balance},
+        headers={"Idempotency-Key": key or uuid.uuid4().hex},
+    )
     assert resp.status_code == 201, resp.text
     return resp.json()["id"]
+
+
+def count_accounts() -> int:
+    with SessionLocal() as db:
+        return db.execute(text("SELECT COUNT(*) FROM accounts")).scalar_one()
 
 
 def balance_of(client_or_http, account_id: str) -> Decimal:
@@ -141,9 +151,7 @@ def assert_ledger_invariants(expected_total: Decimal) -> None:
         assert total == expected_total, f"total balance drifted: {total} != {expected_total}"
 
         # 3. No balance went negative.
-        negatives = db.execute(
-            text("SELECT COUNT(*) FROM accounts WHERE balance < 0")
-        ).scalar_one()
+        negatives = db.execute(text("SELECT COUNT(*) FROM accounts WHERE balance < 0")).scalar_one()
         assert negatives == 0, "an account went negative"
 
         # 4. The balance cache agrees with the entries it summarises:

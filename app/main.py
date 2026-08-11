@@ -21,9 +21,12 @@ therefore enforced in the database, not in application memory.
 
 ### Guarantees
 
-**Exactly-once transfers.** Every `POST /transfers` carries a required
-`Idempotency-Key`. Retrying with the same key returns the original result and moves no
-additional money — whichever instance handles the retry.
+**Exactly-once money operations.** Every `POST /transfers` and every `POST /accounts`
+carries a required `Idempotency-Key`. Retrying with the same key returns the original
+result and neither moves nor mints additional money — whichever instance handles the
+retry. Account creation is guarded too because an opening balance is how value *enters*
+the ledger, so a retried create is as capable of breaking conservation as a retried
+transfer.
 
 **Money is conserved.** Each transfer writes two signed rows to an append-only ledger
 that always nets to zero. Balances can never go negative; a database `CHECK` constraint

@@ -6,3 +6,6 @@ venv/
 .pytest_cache/
 .ruff_cache/
 .env
+
+# The take-home brief itself is not part of the deliverable.
+Engineering Take Over Task.pdf

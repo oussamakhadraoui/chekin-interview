@@ -15,13 +15,13 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 
-from tests.conftest import assert_ledger_invariants, balance_of, make_account
+from tests.conftest import assert_ledger_invariants, balance_of, count_accounts, make_account
 
 
-def fire(http, requests):
+def fire(http, requests, path="/transfers"):
     """Send every request as close to simultaneously as the client can manage."""
     with ThreadPoolExecutor(max_workers=len(requests)) as pool:
-        return list(pool.map(lambda r: http.post("/transfers", **r), requests))
+        return list(pool.map(lambda r: http.post(path, **r), requests))
 
 
 def payload(src, dst, amount, key=None):
@@ -70,10 +70,7 @@ def test_opposing_transfers_do_not_deadlock(http):
     a = make_account(http, "1000")
     b = make_account(http, "1000")
 
-    requests = [
-        payload(a, b, 1) if i % 2 == 0 else payload(b, a, 1)
-        for i in range(40)
-    ]
+    requests = [payload(a, b, 1) if i % 2 == 0 else payload(b, a, 1) for i in range(40)]
     responses = fire(http, requests)
     codes = Counter(r.status_code for r in responses)
 
@@ -119,6 +116,93 @@ def test_concurrent_retries_of_one_key_move_money_once(http):
     assert_ledger_invariants(expected_total=Decimal("1000"))
 
 
+def test_concurrent_conflicting_requests_under_one_key(http):
+    """One key, two *different* transfers, fired together.
+
+    Every other concurrency test covers a path where the correct answer is "the same thing
+    as the winner". This is the one where the correct answer is "no", and it is the only
+    branch in `execute_once` with no concurrent coverage: the loser hits the unique
+    violation, re-reads the winner, and must find the stored fingerprint *disagrees* with
+    its own -- turning what would have been a replay into a 409.
+
+    Getting this wrong is worse than getting a replay wrong. A client would receive a
+    success response, complete with a transfer_id, for a transfer that was never executed
+    and never will be. It would reconcile its own books against money that does not exist.
+
+    Twenty requests, ten of each body. The outcome is fully determined even though the
+    winner is not: whichever body commits, its nine twins replay it and all ten of the
+    other body are refused. That makes this a stronger test than a uniformly-conflicting
+    race would be -- it exercises *both* outcomes of the post-race `replay()` call at once,
+    and would catch an implementation that refused everything as readily as one that
+    replayed everything.
+    """
+    src = make_account(http, "1000")
+    dst = make_account(http, "0")
+    other = make_account(http, "0")
+    key = uuid.uuid4().hex
+
+    requests = [
+        payload(src, dst, 100, key=key) if i % 2 == 0 else payload(src, other, 250, key=key)
+        for i in range(20)
+    ]
+    responses = fire(http, requests)
+    codes = Counter(r.status_code for r in responses)
+
+    assert codes[201] == 1, f"more than one request claimed the key: {dict(codes)}"
+    assert codes[200] == 9, f"the winner's twins did not replay: {dict(codes)}"
+    assert codes[409] == 10, f"a conflicting request was not refused: {dict(codes)}"
+
+    # Every 200 is a replay of the one request that actually committed -- not an
+    # acknowledgement of the request that was sent.
+    winner = next(r for r in responses if r.status_code == 201).json()
+    assert all(r.json() == winner for r in responses if r.status_code == 200)
+
+    # Whichever won, exactly one movement happened and the loser's destination is untouched
+    # by the request it thought it sent.
+    moved = balance_of(http, dst) + balance_of(http, other)
+    assert moved in (Decimal("100"), Decimal("250")), f"unexpected movement: {moved}"
+    assert balance_of(http, src) == Decimal("1000") - moved
+
+    assert_ledger_invariants(expected_total=Decimal("1000"))
+
+
+def test_concurrent_creations_of_one_key_open_one_funded_account(http):
+    """Fifty simultaneous copies of one funded `POST /accounts`.
+
+    The mirror image of the transfer retry test, and the reason account creation is
+    guarded at all. An opening balance is the only way value *enters* this ledger, so a
+    create that runs twice does not duplicate a movement — it conjures 500 out of
+    nothing, and the reconciliation query would find nothing wrong because the second
+    account's `opening_balance` would make its books internally consistent. Conservation
+    would break in the one place the ledger cannot detect on its own.
+
+    There are no row locks to arbitrate this: a fresh account has no prior row to lock.
+    Correctness rests entirely on the primary-key claim in `idempotency_keys`, which is
+    exactly the point — the same single index serialises both endpoints, across
+    instances, with no extra machinery.
+    """
+    key = uuid.uuid4().hex
+    request = {
+        "json": {"initial_balance": "500.00"},
+        "headers": {"Idempotency-Key": key},
+    }
+
+    responses = fire(http, [request for _ in range(50)], path="/accounts")
+    codes = Counter(r.status_code for r in responses)
+
+    assert codes[201] == 1, f"more than one request claimed the key: {dict(codes)}"
+    assert codes[200] == 49, f"unexpected responses: {dict(codes)}"
+
+    # All fifty clients were handed the same account, whichever one of them won.
+    ids = {r.json()["id"] for r in responses}
+    assert len(ids) == 1, f"clients disagreed about which account exists: {ids}"
+
+    # The assertion that actually matters: one row, funded once.
+    assert count_accounts() == 1, "a retry opened a second account"
+    assert balance_of(http, ids.pop()) == Decimal("500.00")
+    assert_ledger_invariants(expected_total=Decimal("500.00"))
+
+
 def test_money_is_conserved_under_random_load(http):
     """The property test: whatever happens, the total does not move.
 
@@ -162,9 +246,7 @@ def test_concurrent_transfers_in_a_cycle_stay_consistent(http):
     requests = [payload(src, dst, 10) for src, dst in ring for _ in range(10)]
     responses = fire(http, requests)
 
-    assert all(r.status_code == 201 for r in responses), Counter(
-        r.status_code for r in responses
-    )
+    assert all(r.status_code == 201 for r in responses), Counter(r.status_code for r in responses)
     # Every account sent and received the same amount, so each ends where it began.
     for account in accounts:
         assert balance_of(http, account) == Decimal("100")

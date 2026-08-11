@@ -23,14 +23,25 @@ PositiveMoney = Annotated[
     PlainSerializer(lambda v: f"{v:.4f}", return_type=str, when_used="json"),
 ]
 
+# Same, but zero is a legitimate opening balance.
+#
+# The serialiser is load-bearing beyond presentation: request fingerprints are taken
+# over `model_dump(mode="json")`, and pydantic's default for a bare Decimal is `str()`,
+# which preserves whatever scale the client happened to send. Without normalising here,
+# "500" and "500.00" would hash differently and a proxy that reserialises JSON could
+# turn a safe retry into a spurious 409 -- precisely the failure PositiveMoney avoids.
+NonNegativeMoney = Annotated[
+    Decimal,
+    Field(ge=0, max_digits=20, decimal_places=4),
+    PlainSerializer(lambda v: f"{v:.4f}", return_type=str, when_used="json"),
+]
+
 
 class ErrorDetail(BaseModel):
     code: str = Field(
         description="Stable machine-readable code. Switch on this, not the HTTP status."
     )
-    message: str = Field(
-        description="Human-readable explanation. May change; do not parse."
-    )
+    message: str = Field(description="Human-readable explanation. May change; do not parse.")
     details: dict[str, Any] | None = Field(
         default=None, description="Structured context, e.g. the offending account id."
     )
@@ -64,18 +75,15 @@ class CreateAccountRequest(BaseModel):
     # Opening a non-zero account is money appearing from nowhere. It is allowed here
     # because the exercise needs a way to get money into the system and there is no
     # external funding rail; see README for how this would work in production.
-    initial_balance: Annotated[
-        Decimal,
-        Field(
-            ge=0,
-            max_digits=20,
-            decimal_places=4,
-            description=(
-                "Opening balance. Send as a string to avoid float rounding. "
-                "Recorded immutably so the ledger can be reconciled against it."
-            ),
+    initial_balance: NonNegativeMoney = Field(
+        default=Decimal("0"),
+        description=(
+            "Opening balance. Send as a string to avoid float rounding. "
+            "Recorded immutably so the ledger can be reconciled against it. "
+            'Equivalent encodings ("500", "500.00", 500) are treated as the same '
+            "request when retried."
         ),
-    ] = Decimal("0")
+    )
 
     model_config = ConfigDict(json_schema_extra={"examples": [{"initial_balance": "500.00"}]})
 

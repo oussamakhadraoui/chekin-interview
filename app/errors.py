@@ -65,21 +65,21 @@ class SameAccountTransfer(LedgerError):
 class IdempotencyKeyConflict(LedgerError):
     """Same key, different request body.
 
-    The client has recycled a key for a genuinely different transfer. Replaying the
-    stored response would silently swallow the new transfer; executing it would break
+    The client has recycled a key for a genuinely different request. Replaying the
+    stored response would silently swallow the new request; executing it would break
     the promise the key makes. Both are worse than refusing.
     """
 
     status_code = 409
     code = "IDEMPOTENCY_KEY_CONFLICT"
     summary = (
-        "This Idempotency-Key was already used for a transfer with a different body. "
-        "Use a fresh key for a different transfer."
+        "This Idempotency-Key was already used for a request with a different body. "
+        "Use a fresh key for a different request."
     )
 
 
 class LockTimeout(LedgerError):
-    """Could not acquire the account locks within lock_timeout.
+    """Could not acquire the needed locks within lock_timeout.
 
     Retryable: the request never started moving money. 503 + Retry-After tells clients
     and load balancers that this is congestion, not a bad request.
@@ -95,7 +95,7 @@ class LockTimeout(LedgerError):
 
 
 class MissingIdempotencyKey(LedgerError):
-    """No Idempotency-Key header on a transfer.
+    """No Idempotency-Key header on a request that creates or moves money.
 
     Required rather than optional: an opt-in safety mechanism means the default
     behaviour is at-least-once money movement.
@@ -104,6 +104,42 @@ class MissingIdempotencyKey(LedgerError):
     status_code = 400
     code = "IDEMPOTENCY_KEY_REQUIRED"
     summary = "The Idempotency-Key header is missing or blank."
+
+
+class InvalidIdempotencyKey(LedgerError):
+    """The header is present but unusable -- currently, longer than the column.
+
+    Checked at the boundary rather than left to the INSERT: PostgreSQL raises 22001 for
+    an over-long value, which arrives as a `DataError` rather than an `IntegrityError`
+    and would escape as a 500. A malformed header is the client's problem and has to be
+    reported as one.
+    """
+
+    status_code = 400
+    code = "IDEMPOTENCY_KEY_INVALID"
+    summary = "The Idempotency-Key header is longer than 255 characters."
+
+
+class AmountOutOfRange(LedgerError):
+    """A value that is individually valid but does not fit once applied.
+
+    Pydantic rejects an over-large *amount* at the boundary, so this cannot be reached by
+    a single oversized field. It exists for the accumulating case: a destination balance
+    that would exceed NUMERIC(20,4) after the credit lands. PostgreSQL raises 22003 for
+    that, which arrives as a `DataError` -- not an `IntegrityError` -- and would otherwise
+    escape every handler in `execute_once` as a bare 500 with no error envelope.
+
+    Exactly the same class of bug as an over-long idempotency key, which is why that one
+    is caught at the boundary and this one is caught by sqlstate: the value is only known
+    to be out of range once the database has done the arithmetic.
+    """
+
+    status_code = 422
+    code = "AMOUNT_OUT_OF_RANGE"
+    summary = (
+        "The resulting balance would exceed the maximum the ledger can represent. "
+        "Nothing was moved and the idempotency key was not consumed."
+    )
 
 
 class ValidationFailed(LedgerError):

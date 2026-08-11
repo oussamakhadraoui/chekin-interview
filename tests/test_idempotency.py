@@ -25,8 +25,13 @@ def test_retry_returns_the_original_result_and_moves_money_once(client):
     assert second.status_code == 200
     assert second.headers["Idempotent-Replay"] == "true"
 
-    # Byte-identical body, including the transfer_id: the retry is answered from the
-    # response stored alongside the money movement, not recomputed.
+    # The same object, including the transfer_id: the retry is answered from the response
+    # stored alongside the money movement, not recomputed.
+    #
+    # Equal as parsed JSON, not as bytes -- the replay is read back out of a JSONB column
+    # and PostgreSQL normalises key order on the way in, so the two responses serialise
+    # their keys in a different order. The object is the contract; the byte order of its
+    # keys is not.
     assert first.json() == second.json()
 
     assert balance_of(client, src) == Decimal("75")
@@ -67,7 +72,7 @@ def test_same_key_with_different_accounts_is_rejected(client):
 
 
 def test_equivalent_amount_encodings_are_the_same_transfer(client):
-    """"25", "25.00" and 25 mean the same thing and must not 409.
+    """ "25", "25.00" and 25 mean the same thing and must not 409.
 
     The fingerprint hashes the parsed request, not the raw bytes, so a proxy or SDK
     that reserialises the body cannot turn a safe retry into a spurious conflict.

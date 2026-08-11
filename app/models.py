@@ -90,20 +90,29 @@ class LedgerEntry(Base):
 
 
 class IdempotencyKey(Base):
-    """A client-supplied key claiming exactly one transfer.
+    """A client-supplied key claiming exactly one state change.
 
-    Written inside the same transaction as the ledger entries, so the key and the
-    money it authorised commit or roll back together. There is no window in which one
-    exists without the other.
+    Written inside the same transaction as the effect it authorises -- the ledger
+    entries of a transfer, or the row of a newly opened account -- so the key and that
+    effect commit or roll back together. There is no window in which one exists without
+    the other.
+
+    One table serves every mutating endpoint. Keys share a single namespace, which is
+    why `operation` is stored: it makes the row self-describing ("what did this key
+    actually do?") without parsing the body, and it is the natural label to break
+    replay metrics down by.
     """
 
     __tablename__ = "idempotency_keys"
 
     key: Mapped[str] = mapped_column(String(255), primary_key=True)
-    # SHA-256 of the canonicalised request body. Lets us tell "this is a retry" apart
-    # from "this is a different transfer sent under a recycled key".
+    # Which endpoint consumed the key: "create_transfer" | "create_account".
+    operation: Mapped[str] = mapped_column(String(32), nullable=False)
+    # SHA-256 of the canonicalised operation + request body. Lets us tell "this is a
+    # retry" apart from "this is a different request sent under a recycled key".
     request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    transfer_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=True)
+    # The thing the request created: a transfer_id, or an account id.
+    resource_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     response_status: Mapped[int] = mapped_column(Integer, nullable=True)
     response_body: Mapped[dict] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
