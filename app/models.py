@@ -30,17 +30,15 @@ class Account(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     balance: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
-    # How much money the account was opened with. Immutable after creation.
-    #
-    # Opening balances are how value *enters* the system; ledger entries are how it
-    # *moves* within it. Keeping them separate is what lets both invariants be exact:
+    # What the account was opened with. Immutable. Opening balances are how value *enters*
+    # the system; ledger entries are how it *moves* within it, and keeping them separate is
+    # what makes both invariants exact:
     #
     #     SUM(ledger_entries.amount) = 0                      (nothing created or lost)
     #     balance = opening_balance + SUM(my ledger entries)  (the cache is honest)
     #
-    # Without this column the second one is unassertable, because a funded account's
-    # balance would legitimately differ from the sum of its entries and there would be
-    # no way to tell that apart from corruption.
+    # Without this column the second is unassertable: a funded account's balance would
+    # legitimately differ from its entries, indistinguishable from corruption.
     opening_balance: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -66,7 +64,13 @@ class LedgerEntry(Base):
         SELECT SUM(amount) FROM ledger_entries  -->  always exactly 0
 
     accounts.balance is a maintained cache of these entries, updated in the same
-    transaction, so reads do not have to aggregate the whole history.
+    transaction, so reads do not aggregate the whole history.
+
+    The schema enforces this, not just the code that writes it: a deferrable constraint
+    trigger (migration c4b8f2e07a13) re-checks at COMMIT that entries sharing a transfer_id
+    sum to zero. Deferred, because the first leg legitimately leaves the sum non-zero; a
+    trigger, because the rule spans a *set* of rows and no CHECK sees more than one. It
+    fires against every writer, including ones that never touch this application.
     """
 
     __tablename__ = "ledger_entries"
@@ -113,8 +117,14 @@ class IdempotencyKey(Base):
     request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     # The thing the request created: a transfer_id, or an account id.
     resource_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
-    response_status: Mapped[int] = mapped_column(Integer, nullable=True)
-    response_body: Mapped[dict] = mapped_column(JSONB, nullable=True)
+    # What the original request answered (201 today for both). Kept for forensics, not for
+    # replay -- a replay deliberately answers 200, because that is the signal telling a
+    # client "this had already happened". Read onto the `idempotency.replayed` log line.
+    response_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Nullable because the row is claimed before the work runs; `execute_once` fills both
+    # in before the commit that makes the claim visible, so a *committed* row always has
+    # them. That is an invariant of the primitive, not of the column.
+    response_body: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

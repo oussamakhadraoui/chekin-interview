@@ -12,12 +12,10 @@ mechanisms:
   3. Concurrency          -> SELECT ... FOR UPDATE on both accounts, acquired in a
                              globally consistent order so instances cannot deadlock.
 
-Everything here is deliberately in the database rather than in the process. The
-service is assumed to run as N stateless instances behind a load balancer, so any
-in-process construct -- a `threading.Lock`, an `asyncio.Lock`, an LRU of seen keys --
-would protect one instance while the other N-1 happily corrupted the ledger. The
-datastore is the only thing all instances share, so it is the only place a guarantee
-can live.
+Everything is in the database rather than the process. With N stateless instances behind a
+load balancer, any in-process construct -- a `threading.Lock`, an LRU of seen keys --
+protects one instance while the other N-1 corrupt the ledger. The datastore is the only
+thing all instances share, so it is the only place a guarantee can live.
 """
 
 import uuid
@@ -38,29 +36,24 @@ OPERATION = "create_transfer"
 def _lock_accounts(db: Session, account_ids: list[uuid.UUID]) -> dict[uuid.UUID, Account]:
     """Take row locks on the given accounts in a globally consistent order.
 
-    Deadlock avoidance. Two concurrent transfers A->B and B->A will each want both
-    rows. If one instance locks A then B while the other locks B then A, they wait on
-    each other and Postgres kills one after `deadlock_timeout`. Sorting the ids first
-    means *every* instance requests locks in the same sequence, so the second one
-    simply queues behind the first. Any total order works as long as all instances
-    agree on it; sorted-by-uuid happens to also match Postgres's own uuid ordering.
+    Deadlock avoidance. A->B and B->A each want both rows; if one instance locks A then B
+    while the other locks B then A they wait on each other and Postgres kills one. Sorting
+    the ids means *every* instance asks in the same sequence, so the second simply queues.
+    Any total order works as long as all instances agree on it.
 
     Locks are taken one statement at a time, on purpose. The tempting one-liner is
 
         select(Account).where(Account.id.in_(ids)).order_by(Account.id).with_for_update()
 
-    but ORDER BY constrains the order rows are *returned*, not the order they are
-    *locked*. For a simple index scan those coincide; under a bitmap heap scan or a
-    parallel plan the locking node can sit below the sort and acquire in heap order,
-    which is arbitrary. That failure mode is planner-dependent, so it would pass tests
-    on a small table and start deadlocking once the table grew enough to change the
-    plan. Two round trips is a cheap price for an ordering that does not depend on the
-    query planner.
+    but ORDER BY constrains the order rows are *returned*, not the order they are *locked*.
+    Under a bitmap heap scan or a parallel plan the locking node can sit below the sort and
+    acquire in heap order. That failure mode is planner-dependent -- it passes on a small
+    table and starts deadlocking once the table grows enough to change the plan. Two round
+    trips is cheap for an ordering that does not depend on the query planner.
 
-    populate_existing=True forces the returned objects to be refreshed from the locked
-    read. Without it SQLAlchemy would hand back whatever version of the row is already
-    in the session's identity map -- a value read *before* the lock was held, which is
-    exactly the stale read the lock exists to prevent.
+    populate_existing=True forces a refreshed read after the lock. Without it SQLAlchemy
+    returns whatever is in the session's identity map -- a value read *before* the lock,
+    which is exactly the stale read the lock exists to prevent.
     """
     locked: dict[uuid.UUID, Account] = {}
     for account_id in sorted(account_ids):

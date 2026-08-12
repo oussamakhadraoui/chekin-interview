@@ -14,6 +14,11 @@ only fails once the database does arithmetic on it. Both have historically escap
 import uuid
 from decimal import Decimal
 
+import pytest
+import sqlalchemy.exc
+from fastapi.testclient import TestClient
+
+from app.main import app
 from tests.conftest import count_accounts, make_account
 
 # 16 integer digits: the largest value `max_digits=20, decimal_places=4` admits, and the
@@ -121,6 +126,131 @@ def test_a_credit_that_would_overflow_the_column_is_a_422_not_a_500(client):
     # partial write that happened to report an error.
     assert Decimal(client.get(f"/accounts/{src}/balance").json()["balance"]) == Decimal(MAX_MONEY)
     assert Decimal(client.get(f"/accounts/{dst}/balance").json()["balance"]) == Decimal(MAX_MONEY)
+
+
+# --- the failures nobody anticipated -------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "boom",
+    [
+        pytest.param(RuntimeError("something nobody predicted"), id="unmapped-exception"),
+        pytest.param(
+            sqlalchemy.exc.TimeoutError("QueuePool limit of size 20 reached"),
+            id="pool-checkout-timeout",
+        ),
+    ],
+)
+def test_an_unanticipated_failure_still_leaves_through_the_envelope(monkeypatch, boom):
+    """The promise is "every failure", not "every failure I thought of".
+
+    Before the catch-all handler existed, anything that was not a `LedgerError` or a
+    `RequestValidationError` left as `text/plain` "Internal Server Error" -- so a client
+    switching on `error.code` got a JSON parse failure on top of an outage.
+
+    The two cases are chosen to be a class, not a pair. `RuntimeError` stands for
+    "a bug we have not written yet". `sqlalchemy.exc.TimeoutError` is the one that is
+    reachable in production today: it is raised on connection-pool checkout and it is a
+    *sibling* of `OperationalError`, not a subclass, so every sqlstate branch in
+    `execute_once` misses it. Exactly the shape of the two bugs already fixed in this
+    codebase, both of which were fixed one instance at a time.
+
+    `raise_server_exceptions=False` because Starlette re-raises after rendering, so that
+    a real server still logs the traceback. The client-facing response is what is under
+    test here.
+    """
+    import app.routers.transfers as router
+
+    def explode(*_args, **_kwargs):
+        raise boom
+
+    monkeypatch.setattr(router, "execute_transfer", explode)
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        resp = client.post(
+            "/transfers",
+            json={
+                "from_account_id": str(uuid.uuid4()),
+                "to_account_id": str(uuid.uuid4()),
+                "amount": "10",
+            },
+            headers={"Idempotency-Key": uuid.uuid4().hex},
+        )
+
+    assert resp.status_code == 500
+    assert resp.headers["content-type"].startswith("application/json")
+    error = envelope_of(resp)
+    assert error["code"] == "INTERNAL_ERROR"
+
+    # The exception's own text is the one string nobody has audited for secrets. It
+    # belongs in the log, joined to this response by the request id -- not in the body.
+    assert "QueuePool" not in resp.text
+    assert "nobody predicted" not in resp.text
+
+
+def test_the_request_thread_pool_is_not_wider_than_the_connection_pool(client):
+    """`threads <= pool_size + max_overflow`, asserted rather than hoped for.
+
+    Every endpoint is sync, so each one occupies an AnyIO worker thread *and* needs a
+    connection. AnyIO defaults to 40 threads; the pool is 30. Left at the default, the
+    ten surplus threads queue on connection checkout rather than on the row they are
+    actually contending for -- and that wait is bounded by `pool_timeout` (30s), not by
+    `lock_timeout` (3s), and fails as an unhandled `TimeoutError` rather than a
+    retryable 503. The bound `lock_timeout` exists to enforce would be reintroduced one
+    layer up, an order of magnitude larger.
+
+    The `client` fixture enters the app's lifespan, which is what applies the sizing.
+    """
+    from app.config import settings
+
+    connections = settings.db_pool_size + settings.db_max_overflow
+
+    assert app.state.request_threads == connections, (
+        f"{app.state.request_threads} request threads against {connections} connections: "
+        "surplus threads will wait on pool checkout under pool_timeout, not lock_timeout."
+    )
+
+
+# --- unknown fields ------------------------------------------------------------
+
+
+def test_an_unknown_field_is_rejected_rather_than_silently_dropped(client):
+    """An ignored field is invisible to the request fingerprint.
+
+    The fingerprint is a hash of the *parsed* model, which is what makes `"25"` and
+    `"25.00"` the same request. The same property makes anything pydantic drops the same
+    request too: with the default `extra="ignore"`, a transfer carrying
+    `"currency": "EUR"` and one carrying `"currency": "USD"` hash identically, and the
+    second is answered as a replay of the first.
+
+    So this is not style. Rejecting the field is what keeps "same fingerprint" meaning
+    "same request" -- and a money API should never accept a field it does not honour.
+    """
+    src = make_account(client, "100")
+    dst = make_account(client, "0")
+
+    resp = client.post(
+        "/transfers",
+        json={
+            "from_account_id": src,
+            "to_account_id": dst,
+            "amount": "10",
+            "currency": "EUR",
+        },
+        headers={"Idempotency-Key": uuid.uuid4().hex},
+    )
+
+    assert resp.status_code == 422
+    assert envelope_of(resp)["code"] == "VALIDATION_ERROR"
+    assert Decimal(client.get(f"/accounts/{dst}/balance").json()["balance"]) == Decimal("0")
+
+    account = client.post(
+        "/accounts",
+        json={"initial_balance": "10", "owner": "alice"},
+        headers={"Idempotency-Key": uuid.uuid4().hex},
+    )
+    assert account.status_code == 422
+    assert envelope_of(account)["code"] == "VALIDATION_ERROR"
 
 
 # --- idempotency key normalisation ---------------------------------------------

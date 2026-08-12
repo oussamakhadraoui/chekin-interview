@@ -1,17 +1,15 @@
 """Exactly-once execution for state-changing endpoints.
 
-Idempotency is not a property of transfers. It is a property of any request that puts
-value into the ledger or moves it around. `POST /accounts` opens a *funded* account, so
-a retried create conjures money exactly as surely as a retried transfer moves it twice.
-Both endpoints therefore go through the primitive in this module, backed by the same
-`idempotency_keys` table and the same SHA-256 request fingerprint.
+Idempotency is a property of any request that puts value into the ledger or moves it
+around, not of transfers specifically -- `POST /accounts` opens a *funded* account, so a
+retried create conjures money as surely as a retried transfer moves it twice. Both go
+through this primitive, on one table and one fingerprint.
 
-The whole mechanism is one primary-key insert. PostgreSQL blocks a duplicate insert
-until the first transaction resolves, so a single unique index is what serialises
-retries across every instance behind the load balancer -- no advisory locks, no Redis,
-no coordination service. The claim is taken inside the same transaction as the work it
-authorises, so the key and its effect commit or roll back together. There is no window
-in which one exists without the other.
+The whole mechanism is a primary-key insert. PostgreSQL blocks a duplicate until the first
+transaction resolves, so one unique index serialises retries across every instance -- no
+advisory locks, no Redis, no coordination service. The claim is taken inside the same
+transaction as the work it authorises, so there is no window in which one exists without
+the other.
 """
 
 import hashlib
@@ -27,8 +25,8 @@ from sqlalchemy.orm import Session
 from app.errors import (
     AmountOutOfRange,
     IdempotencyKeyConflict,
+    InternalError,
     InvalidIdempotencyKey,
-    LedgerError,
     LockTimeout,
     MissingIdempotencyKey,
 )
@@ -75,42 +73,57 @@ class Outcome:
 def fingerprint(req: BaseModel) -> str:
     """Stable hash of the *meaning* of a request body.
 
-    Hashing the parsed model rather than the raw bytes means whitespace, key order and
-    `"100"` vs `"100.00"` all fingerprint identically -- those are the same request, and
-    a client retrying through a proxy that reserialises JSON should not get a spurious
-    409. A different amount or a different account pair does change the hash, which is
-    the case we actually want to catch.
+    Hashing the parsed model rather than raw bytes means whitespace, key order and `"100"`
+    vs `"100.00"` fingerprint identically -- they are the same request, and a retry through
+    a proxy that reserialises JSON must not 409. A different amount or account pair does
+    change the hash, which is the case worth catching.
 
-    Note that the "100" == "100.00" property comes from the *serialisers on the money
-    fields*, not from anything here: pydantic renders a bare Decimal with `str()`, which
-    preserves whatever scale the client sent. Every money field must normalise, or a
-    safe retry becomes a 409. There is a test per endpoint pinning that.
+    That `"100" == "100.00"` property comes from the *serialisers on the money fields*, not
+    from here: pydantic renders a bare Decimal with `str()`, preserving whatever scale the
+    client sent. Every money field must normalise or a safe retry becomes a 409; there is a
+    test per endpoint pinning it.
 
-    The operation is deliberately NOT hashed. It is compared as its own column instead
-    (see `replay`), which gives the same answer while keeping the hash a pure function
-    of the body -- so adding an endpoint to this table never invalidates hashes already
-    stored by a running deploy.
+    The operation is deliberately NOT hashed -- it is compared as its own column (see
+    `replay`), which keeps the hash a pure function of the body, so adding an endpoint
+    never invalidates hashes already stored by a running deploy.
     """
     canonical = json.dumps(req.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
-def replay(record: IdempotencyKey, operation: str, request_hash: str) -> Outcome:
+def replay(
+    record: IdempotencyKey, operation: str, request_hash: str, *, raced: bool = False
+) -> Outcome:
     """Answer from the stored response, or refuse if the key was recycled.
 
-    Keys share a single namespace across endpoints, so "same key, different operation"
-    is checked explicitly rather than left to the accident that two endpoints' request
-    bodies happen to differ.
+    Keys share one namespace across endpoints, so "same key, different operation" is
+    checked explicitly rather than left to the accident that two endpoints' bodies differ.
 
-    The body is returned *verbatim* rather than re-validated through the response model:
-    it is a snapshot of what that client was promised, and it should survive a later
-    schema change that the old body would no longer parse under.
+    The body is returned *verbatim*, not re-validated through the response model: it is a
+    snapshot of what that client was promised and should survive a schema change it would
+    no longer parse under.
+
+    A replay answers 200 rather than the stored `response_status` deliberately -- the
+    200-vs-201 distinction is what tells a client "this had already happened", and it is
+    the signal that survives a proxy stripping `Idempotent-Replay`. The original status
+    goes on the log line, where it is useful for reconciling reports against what we sent.
     """
     if record.operation != operation or record.request_hash != request_hash:
         raise IdempotencyKeyConflict(
             "This idempotency key was already used for a different request.",
             {"idempotency_key": record.key, "operation": record.operation},
         )
+    log.info(
+        "idempotency.replayed",
+        operation=operation,
+        idempotency_key=record.key,
+        resource_id=str(record.resource_id) if record.resource_id else None,
+        original_status=record.response_status,
+        # True when this request lost the race for the key rather than arriving after
+        # the winner had already committed. A rising ratio means clients are retrying
+        # faster than requests complete.
+        raced=raced,
+    )
     return Outcome(status_code=200, body=record.response_body, replayed=True)
 
 
@@ -180,20 +193,19 @@ def execute_once(
         # conflicting. So the completed record is readable now.
         winner = db.get(IdempotencyKey, key)
         if winner is None:  # pragma: no cover - would mean the key was pruned mid-flight
-            raise LedgerError("Idempotency record vanished during a concurrent retry.") from exc
-        log.info("idempotency.replayed_after_race", operation=operation, idempotency_key=key)
-        return replay(winner, operation, request_hash)
+            # Not a client error: our own insert conflicted with a row that is no longer
+            # there, which means something deleted it between the violation and this
+            # read. `InternalError` rather than the 400-status `LedgerError` base, so an
+            # anomaly on our side is not reported to the client as their mistake.
+            log.error("idempotency.record_vanished", operation=operation, idempotency_key=key)
+            raise InternalError("Idempotency record vanished during a concurrent retry.") from exc
+        return replay(winner, operation, request_hash, raced=True)
 
     except DataError as exc:
         db.rollback()
-        # A value that passed schema validation but does not fit once the database applies
-        # it -- in practice, a credit that would push a balance past NUMERIC(20,4).
-        #
-        # This branch exists because DataError is a sibling of IntegrityError, not a
-        # subclass: without it, 22003 escapes as a bare 500 with no error envelope. That is
-        # the same failure shape as an over-long idempotency key, which is handled at the
-        # boundary in `require_key`. The difference is that an out-of-range *result* is only
-        # knowable after the arithmetic, so it has to be caught here instead.
+        # A value that passed schema validation but does not fit once applied -- a credit
+        # pushing a balance past NUMERIC(20,4). DataError is a *sibling* of IntegrityError,
+        # so without this branch 22003 escapes as a bare 500 with no envelope.
         if sqlstate(exc) != PG_NUMERIC_OUT_OF_RANGE:
             raise
         log.warning("ledger.value_out_of_range", operation=operation, idempotency_key=key)

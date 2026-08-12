@@ -137,6 +137,48 @@ def test_transactions_list_shows_both_sides(client):
     assert incoming[0]["transfer_id"] == outgoing[0]["transfer_id"]
 
 
+def test_database_refuses_a_one_sided_ledger_entry(client):
+    """Conservation is a property of the schema, not of the code path that writes it.
+
+    `_move_money` always writes both legs, and every concurrency test asserts the ledger
+    nets to zero. Neither fact constrains a writer that does not go through this
+    application -- a psql session, a future batch job, a code path nobody has written
+    yet. Before the constraint trigger, a lone `+500` INSERT committed happily and
+    `SUM(ledger_entries.amount)` silently stopped being zero, which is the one thing the
+    whole exercise is about.
+
+    Written past the application on purpose, exactly like the negative-balance test: a
+    backstop that is only ever exercised through the happy path is not a backstop.
+
+    The check must be *deferred*. Asserting it per-statement would reject the first leg
+    of every legitimate transfer, since the sum is only zero once both rows exist -- so
+    this also pins that the trigger fires at COMMIT rather than on INSERT.
+    """
+    import sqlalchemy
+    from sqlalchemy import text
+
+    from app.db import engine
+
+    account_id = make_account(client, "5")
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO ledger_entries (id, transfer_id, account_id, amount)
+                    VALUES (gen_random_uuid(), gen_random_uuid(), :account_id, 500)
+                    """
+                ),
+                {"account_id": account_id},
+            )
+    except sqlalchemy.exc.IntegrityError as exc:
+        assert "does not conserve money" in str(exc)
+    else:
+        raise AssertionError("database allowed money to appear from nowhere")
+
+    assert_ledger_invariants(expected_total=Decimal("5"))
+
+
 def test_database_refuses_a_negative_balance(client):
     """The CHECK constraint is a real backstop, not decoration.
 

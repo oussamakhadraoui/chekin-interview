@@ -72,16 +72,14 @@ def create_account(
 ):
     """Open an account, optionally funded, exactly once.
 
-    The opening balance is how money *enters* the system — there is no deposit rail in
-    this service, so account creation is the only place value is created. It is stored
-    immutably on the account, which is what makes the ledger reconcilable:
-    `balance == opening_balance + sum(entries)` must hold for every account, forever.
+    The opening balance is how money *enters* the system — there is no deposit rail here,
+    so this is the only place value is created. It is stored immutably, which is what makes
+    the ledger reconcilable: `balance == opening_balance + sum(entries)`, for every account,
+    forever.
 
-    Because this endpoint mints value, it carries the same **required**
-    `Idempotency-Key` as a transfer. A retried create must not conjure a second funded
-    account — and that guarantee holds when the retry lands on a different instance
-    than the original, for the same reason it does for transfers: the claim lives in
-    the shared database, not in a process.
+    Because this endpoint mints value it carries the same **required** `Idempotency-Key` as
+    a transfer, and for the same reason that guarantee survives a retry landing on a
+    different instance: the claim lives in the shared database, not in a process.
     """
     outcome = service.create_account(db, require_key(idempotency_key), payload)
 

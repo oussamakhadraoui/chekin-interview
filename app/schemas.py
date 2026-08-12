@@ -85,7 +85,16 @@ class CreateAccountRequest(BaseModel):
         ),
     )
 
-    model_config = ConfigDict(json_schema_extra={"examples": [{"initial_balance": "500.00"}]})
+    # `extra="forbid"` is load-bearing for idempotency, not just tidiness. The request
+    # fingerprint is taken over the *parsed* model, so anything pydantic drops is
+    # invisible to the hash: with the default `extra="ignore"`, two requests that differ
+    # only in an unmodelled field fingerprint identically and the second is answered as
+    # a replay of the first. Rejecting the field is the only way "same fingerprint" can
+    # keep meaning "same request".
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={"examples": [{"initial_balance": "500.00"}]},
+    )
 
 
 class AccountResponse(BaseModel):
@@ -115,7 +124,12 @@ class TransferRequest(BaseModel):
         )
     )
 
+    # See CreateAccountRequest: an unmodelled field that pydantic silently drops would
+    # be invisible to the request fingerprint, so two different requests would replay
+    # each other. A money API should also never accept a field it does not honour --
+    # a client sending `"currency": "EUR"` deserves a 422, not a silent USD transfer.
     model_config = ConfigDict(
+        extra="forbid",
         json_schema_extra={
             "examples": [
                 {
@@ -124,7 +138,7 @@ class TransferRequest(BaseModel):
                     "amount": "125.50",
                 }
             ]
-        }
+        },
     )
 
 

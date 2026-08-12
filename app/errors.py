@@ -109,10 +109,9 @@ class MissingIdempotencyKey(LedgerError):
 class InvalidIdempotencyKey(LedgerError):
     """The header is present but unusable -- currently, longer than the column.
 
-    Checked at the boundary rather than left to the INSERT: PostgreSQL raises 22001 for
-    an over-long value, which arrives as a `DataError` rather than an `IntegrityError`
-    and would escape as a 500. A malformed header is the client's problem and has to be
-    reported as one.
+    Checked at the boundary rather than left to the INSERT, where PostgreSQL's 22001
+    arrives as a `DataError` and would escape as a 500. A malformed header is the
+    client's problem and has to be reported as one.
     """
 
     status_code = 400
@@ -123,15 +122,12 @@ class InvalidIdempotencyKey(LedgerError):
 class AmountOutOfRange(LedgerError):
     """A value that is individually valid but does not fit once applied.
 
-    Pydantic rejects an over-large *amount* at the boundary, so this cannot be reached by
-    a single oversized field. It exists for the accumulating case: a destination balance
-    that would exceed NUMERIC(20,4) after the credit lands. PostgreSQL raises 22003 for
-    that, which arrives as a `DataError` -- not an `IntegrityError` -- and would otherwise
-    escape every handler in `execute_once` as a bare 500 with no error envelope.
+    Pydantic rejects an over-large *amount* at the boundary, so this is unreachable from a
+    single oversized field. It exists for the accumulating case: a destination balance that
+    would exceed NUMERIC(20,4) once the credit lands, which PostgreSQL reports as 22003.
 
-    Exactly the same class of bug as an over-long idempotency key, which is why that one
-    is caught at the boundary and this one is caught by sqlstate: the value is only known
-    to be out of range once the database has done the arithmetic.
+    Same class of bug as `InvalidIdempotencyKey`, caught in a different place: an
+    out-of-range *result* is only knowable after the database has done the arithmetic.
     """
 
     status_code = 422
@@ -140,6 +136,25 @@ class AmountOutOfRange(LedgerError):
         "The resulting balance would exceed the maximum the ledger can represent. "
         "Nothing was moved and the idempotency key was not consumed."
     )
+
+
+class InternalError(LedgerError):
+    """Anything that reached the client as a bare 500 before this existed.
+
+    "Every failure uses one envelope" is worth only as much as its weakest path. Handlers
+    for known exception types cover what we anticipated; this covers what we did not -- a
+    dropped connection, an unmapped sqlstate, a pool checkout timeout
+    (`sqlalchemy.exc.TimeoutError`, a *sibling* of `OperationalError`, so no branch in
+    `execute_once` sees it). Without it those leave as `text/plain`.
+
+    The message is deliberately generic: an unexpected exception's text is the one string
+    nobody has audited for secrets. It goes to the log, joined by the request id.
+    """
+
+    status_code = 500
+    code = "INTERNAL_ERROR"
+    summary = "An unexpected internal error occurred. The request was not applied."
+    retryable = True
 
 
 class ValidationFailed(LedgerError):
