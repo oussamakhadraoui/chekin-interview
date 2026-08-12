@@ -38,7 +38,7 @@ Tests need a real Postgres, and run against their own `ledger_test` database:
 ```bash
 docker compose up -d db
 uv venv && uv pip install -e ".[dev]"
-pytest -v        # 58 tests
+uv run pytest -v        # 58 tests
 ```
 
 ## The API
